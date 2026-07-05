@@ -43,6 +43,7 @@ from model import (
     REAL_TARGET_RADIUS,
     REAL_TARGET_HEIGHT,
     missile_position,
+    batch_quick_score,
 )
 
 UAV_NAME = "FY1"
@@ -64,25 +65,32 @@ BOUNDS = [
 DET_TIME_MAX = 70.0
 
 
-def objective(x: np.ndarray, n_coarse: int = 150) -> float:
+def objective(
+    x: np.ndarray,
+    n_coarse: int = 150,
+    uav_name: str = UAV_NAME,
+    missile_name: str = MISSILE_NAME,
+) -> float:
     """负的遮蔽时长（供最小化算法使用）。"""
     speed, heading, t_drop, t_fuze = x
     duration, _, _, _ = F_single_bomb(
-        UAV_NAME, MISSILE_NAME, speed, heading, t_drop, t_fuze, n_coarse=n_coarse
+        uav_name, missile_name, speed, heading, t_drop, t_fuze, n_coarse=n_coarse
     )
     return -duration
 
 
 def geometric_candidates(
+    uav_name: str = UAV_NAME,
+    missile_name: str = MISSILE_NAME,
     n_samples: int = 200_000,
     perturb_scale: float = 8.0,
     rng: np.random.Generator = np.random.default_rng(0),
 ) -> np.ndarray:
     """
-    几何构造候选起爆配置，并反解为 FY1 实际可达的控制量。
+    几何构造候选起爆配置，并反解为指定无人机实际可达的控制量。
     返回形状 (n_feasible, 4) 的数组，每行是一个可行的 (speed, heading, t_drop, t_fuze)。
     """
-    p0 = UAV_INIT[UAV_NAME]
+    p0 = UAV_INIT[uav_name]
 
     det_times = rng.uniform(0.01, DET_TIME_MAX, n_samples)
     s = rng.uniform(0.0, 1.0, n_samples)  # 沿"导弹->目标边缘点"连线的位置比例
@@ -90,7 +98,7 @@ def geometric_candidates(
     target_z = rng.uniform(0.0, REAL_TARGET_HEIGHT, n_samples)
     perturb = rng.normal(scale=perturb_scale, size=(n_samples, 3))
 
-    m = missile_position(MISSILE_NAME, det_times)  # (n_samples, 3)
+    m = missile_position(missile_name, det_times)  # (n_samples, 3)
     tgt = np.stack(
         [
             REAL_TARGET_CENTER[0] + REAL_TARGET_RADIUS * np.cos(theta),
@@ -115,6 +123,41 @@ def geometric_candidates(
         (dz >= 0) & (t_drop >= 0) & (speed >= UAV_SPEED_MIN) & (speed <= UAV_SPEED_MAX)
     )
     return np.stack([speed, heading, t_drop, t_fuze], axis=1)[feasible]
+
+
+MAX_CLUSTER_INPUT = 3000  # 聚类是 O(n^2)，候选太多时先随机抽样，不影响找出各个孤岛
+
+
+def quick_filter_nonzero(
+    uav_name: str,
+    missile_name: str,
+    candidates: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    向量化粗筛：一次性给一大批候选打分（而不是逐点调用 F_single_bomb 精确求根），
+    过滤掉遮蔽分数为 0 的候选。候选数量一大（比如离目标更近的无人机，可行候选可能
+    有几万甚至十万个）时，逐点精确求根太慢，这一步只需要快速筛掉明显没用的候选；
+    过滤后若数量仍然很大，随机抽样降到 MAX_CLUSTER_INPUT 以内再交给聚类——
+    候选多只是说明这架机的可行孤岛"体积占比"大、容易采到，不需要全部保留才能
+    找出所有孤岛。
+    """
+    if len(candidates) == 0:
+        return candidates
+    scores = batch_quick_score(
+        uav_name,
+        missile_name,
+        candidates[:, 0],
+        candidates[:, 1],
+        candidates[:, 2],
+        candidates[:, 3],
+        n_t=15,
+    )
+    nonzero = candidates[scores > 0]
+    if len(nonzero) > MAX_CLUSTER_INPUT:
+        idx = rng.choice(len(nonzero), size=MAX_CLUSTER_INPUT, replace=False)
+        nonzero = nonzero[idx]
+    return nonzero
 
 
 def cluster_candidates(candidates: np.ndarray, gap: float = 0.08) -> list[np.ndarray]:
@@ -156,12 +199,21 @@ def cluster_candidates(candidates: np.ndarray, gap: float = 0.08) -> list[np.nda
     return [candidates[idx] for idx in groups.values()]
 
 
-def polish(x0: np.ndarray, n_coarse: int = 800) -> tuple[np.ndarray, float]:
-    """对单个候选点做带边界约束的 Nelder-Mead 局部精修。"""
+def polish(
+    x0: np.ndarray,
+    n_coarse: int = 200,
+    uav_name: str = UAV_NAME,
+    missile_name: str = MISSILE_NAME,
+) -> tuple[np.ndarray, float]:
+    """
+    对单个候选点做带边界约束的 Nelder-Mead 局部精修。
+    n_coarse=200 实测和 800 结果完全一致（精确到打印精度），但快 16 倍
+    （800 时单次精修 ~28s，200 时 ~1.8s），大量候选/多架无人机批量精修时差别很大。
+    """
     result = minimize(
         objective,
         x0,
-        args=(n_coarse,),
+        args=(n_coarse, uav_name, missile_name),
         method="Nelder-Mead",
         bounds=BOUNDS,
         options={"xatol": 1e-7, "fatol": 1e-9, "maxiter": 3000},
@@ -169,16 +221,53 @@ def polish(x0: np.ndarray, n_coarse: int = 800) -> tuple[np.ndarray, float]:
     return result.x, -result.fun
 
 
+def solve_single_uav_single_bomb(
+    uav_name: str,
+    missile_name: str,
+    rng: np.random.Generator,
+    n_samples: int = 200_000,
+) -> list[tuple[np.ndarray, float]]:
+    """
+    对指定的 (uav_name, missile_name) 跑一遍完整流程：几何构造候选 -> 聚类分孤岛
+    -> 逐个精修，返回按遮蔽时长从优到劣排序的 [(x, duration), ...] 列表。
+    这是问题2逻辑的可复用版本，供问题4对多架无人机分别调用。
+    """
+    feasible = geometric_candidates(
+        uav_name=uav_name, missile_name=missile_name, n_samples=n_samples, rng=rng
+    )
+    nonzero = quick_filter_nonzero(uav_name, missile_name, feasible, rng)
+    if len(nonzero) == 0:
+        return []
+
+    clusters = cluster_candidates(nonzero)
+    seeds = []
+    for cluster in clusters:
+        cluster_scores = np.array(
+            [
+                -objective(
+                    x, n_coarse=150, uav_name=uav_name, missile_name=missile_name
+                )
+                for x in cluster
+            ]
+        )
+        seeds.append(cluster[np.argmax(cluster_scores)])
+
+    polished = [
+        polish(x0, uav_name=uav_name, missile_name=missile_name) for x0 in seeds
+    ]
+    polished.sort(key=lambda item: item[1], reverse=True)
+    return polished
+
+
 if __name__ == "__main__":
-    # rng = np.random.default_rng(42)
+    rng = np.random.default_rng(42)
 
     # ---- 第一阶段：几何构造候选起爆配置，反解为可行控制量 ----
-    feasible = geometric_candidates()
+    feasible = geometric_candidates(rng=rng)
     print("采样得到 %d 个可行候选（速度/时间约束均满足）" % len(feasible))
 
-    # 用较低精度快速评分，先过滤掉零遮蔽的候选
-    scores = np.array([-objective(x, n_coarse=60) for x in feasible])
-    nonzero = feasible[scores > 0]
+    # 向量化粗筛，先过滤掉零遮蔽的候选（比逐点调用 F_single_bomb 精确求根快得多）
+    nonzero = quick_filter_nonzero(UAV_NAME, MISSILE_NAME, feasible, rng)
     print("其中 %d 个候选有非零遮蔽" % len(nonzero))
 
     # ---- 第二阶段：聚类成互相独立的"孤岛"，每个孤岛取最优代表点 ----
